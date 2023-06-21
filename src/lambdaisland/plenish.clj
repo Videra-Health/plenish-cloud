@@ -3,37 +3,27 @@
   transaction."
   (:require [charred.api :as charred]
             [clojure.string :as str]
-            [datomic.api :as d]
+            [datomic.client.api :as d]
             [honey.sql :as honey]
+            [lambdaisland.plenish.util :as util]
             [honey.sql.helpers :as hh]
             [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs]))
+            [next.jdbc.result-set :as rs])
+  (:import [java.util Date]))
 
 (set! *warn-on-reflection* true)
 
 (def ^:dynamic *debug* (= (System/getenv "PLENISH_DEBUG") "true"))
 (defn dbg [& args] (when *debug* (prn args)))
 
-;; Basic helpers
-
-(defn has-attr?
-  "Does the entity `eid` have the attribute `attr` in the database `db`.
-
-  Uses direct index access so we can cheaply check if a give entity should be
-  added to a given table, based on a membership attribute."
-  [db eid attr]
-  (-> db
-      ^Iterable (d/datoms :eavt eid attr)
-      .iterator
-      .hasNext))
-
 ;;;;;;;;;;;;;;;;
 ;; Datom helpers
-(def -e "Get the entity id of a datom" (memfn ^datomic.Datom e))
-(def -a "Get the attribute of a datom" (memfn ^datomic.Datom a))
-(def -v "Get the value of a datom" (memfn ^datomic.Datom v))
-(def -t "Get the transaction number of a datom" (memfn ^datomic.Datom tx))
-(def -added? "Has this datom been added or retracted?" (memfn ^datomic.Datom added))
+
+(def -e "Get the entity id of a datom" :e)
+(def -a "Get the attribute of a datom" :a)
+(def -v "Get the value of a datom" :v)
+(def -t "Get the transaction number of a datom" :tx)
+(def -added? "Has this datom been added or retracted?" :added)
 
 ;;;;;;;;;;;;;;;;;;;
 ;; Context helpers
@@ -114,6 +104,7 @@
   "Find a name for a column based on the table membership attribute, and the
   attribute whose values are to be stored in the column."
   [ctx mem-attr col-attr]
+  ;;{:pre [(some? col-attr)]}
   (get-in ctx
           [:tables mem-attr :rename col-attr]
           (dash->underscore (name col-attr))))
@@ -139,7 +130,7 @@
   ;; moment this is not a great issue.
   [ctx tx-data]
   (let [db-ident  (get-in ctx [:entids :db/ident])
-        tx-idents (filter #(= db-ident (-a %)) tx-data)
+        tx-idents (util/remove-update-retracts (filter #(= db-ident (-a %)) tx-data))
         tx-rest   (remove #(= db-ident (-a %)) tx-data)]
     (as-> ctx ctx
       ;; Handle `[_ :db/ident _]` datoms first. We can't rely on any ordering of
@@ -149,7 +140,6 @@
       ;; is an ident.
       (reduce (fn [ctx datom]
                 (let [e     (-e datom)
-                      a     (-a datom)
                       ident (-v datom)]
                   (if (-added? datom)
                     (-> ctx
@@ -163,37 +153,44 @@
               ctx
               tx-idents)
       ;; Handle non `[_ :db/ident _]` datoms
-      (reduce (fn [ctx datom]
-                (let [e (-e datom)
-                      a (-a datom)]
-                  (if (get-in ctx [:idents e])
-                    (-> ctx
-                        (update-in
-                         [:idents e]
-                         (fn [m]
-                           (let [attr (ctx-ident ctx (-a datom))]
-                             (if (-added? datom)
-                               (assoc m attr (-v datom))
-                               (dissoc m attr))))))
-                    ctx)))
-              ctx
-              tx-rest))))
+      ;; This fills in all of the facts about the attribute (e.g. :db/cardinality)
+      ;; after the above created it in (:idents ctx)
+      ;; MKHTODO Would need to rename the column as well!!!! (right now the new column is created, the old one is deleted)
+      (->> tx-rest
+           (filter #(get-in ctx [:idents (-e %)]))
+           util/remove-update-retracts ;; We run this a bit later rather than at the top for speed
+           (reduce (fn [ctx datom]
+                     (-> ctx
+                         (update-in
+                          [:idents (-e datom)]
+                          (fn [m]
+                            (let [attr (ctx-ident ctx (-a datom))]
+                              (if (-added? datom)
+                                (assoc m attr (-v datom))
+                                (dissoc m attr)))))))
+                   ctx)))))
+
+(def pg-min-date -210898425600000)
+
+(def pg-max-date 9224286307200000)
 
 (defn encode-value
   "Do some pre-processing on a value based on the datomic value type, so that
   HoneySQL/JDBC is happy with it. Somewhat naive and postgres specific right
   now."
-  [ctx type value]
-  (case type
-    :db.type/ref (if (keyword? value)
-                   (ctx-entid ctx value)
-                   value)
-    :db.type/tuple [:raw (str \' (str/replace (str (charred/write-json-str value)) "'" "''") \' "::jsonb")]
-    :db.type/keyword (str (when (qualified-ident? value)
-                            (str (namespace value) "/"))
-                          (name value))
-    :db.type/instant [:raw (format "to_timestamp(%.3f)" (double (/ (.getTime ^java.util.Date value) 1000)))]
-    value))
+  [ctx attr-id value]
+  (let [datomic-type (ctx-valueType ctx attr-id)]
+    (case datomic-type
+      :db.type/ref (if (keyword? value)
+                     (ctx-entid ctx value)
+                     value)
+      :db.type/tuple [:raw (str \' (str/replace (str (charred/write-json-str value)) "'" "''") \' "::jsonb")]
+      :db.type/keyword (str (when (qualified-ident? value)
+                              (str (namespace value) "/"))
+                            (name value))
+      :db.type/instant [:raw (format "to_timestamp(%.3f)"
+                                     (double (/ (util/clamp (.getTime ^java.util.Date value) pg-min-date pg-max-date) 1000)))]
+      value)))
 
 ;; The functions below are the heart of the process
 
@@ -206,16 +203,12 @@
   "Add operations `:ops` to the context for all the `cardinality/one` datoms in a
   single transaction and a single entity/table, identified by its memory
   attribute."
-  [{:keys [tables] :as ctx} mem-attr eid datoms]
+  [{:keys [tables] :as ctx} mem-attr eid datoms t]
   {:pre [(every? #(= eid (-e %)) datoms)]}
   (let [;; An update of an attribute will manifest as two datoms in the same
         ;; transaction, one with added=true, and one with added=false. In this
         ;; case we can ignore the added=false datom.
-        datoms (remove (fn [d]
-                         (and (not (-added? d))
-                              (some #(and (= (-a d) (-a %))
-                                          (-added? %)) datoms)))
-                       datoms)
+        datoms (util/remove-update-retracts datoms)
         ;; Figure out which columns don't exist yet in the target database. This
         ;; may find columns that actually do already exist, depending on the
         ;; state of the context. This is fine, we'll process these schema
@@ -279,13 +272,10 @@
                                     ;; Bit of manual fudgery to also get the "t"
                                     ;; value of each transaction into
                                     ;; our "transactions" table.
-                                    (= :db/txInstant mem-attr)
-                                    (assoc "t" (d/tx->t (-t (first datoms)))))
+                                    (= :db/txInstant mem-attr) (assoc "t" t))
                                   (map (juxt #(column-name ctx mem-attr (ctx-ident ctx (-a %)))
                                              #(when (-added? %)
-                                                (encode-value ctx
-                                                              (ctx-valueType ctx (-a %))
-                                                              (-v %)))))
+                                                (encode-value ctx (-a %) (-v %)))))
                                   datoms)}]))))))
 
 (defn card-many-entity-ops
@@ -326,7 +316,7 @@
                       value (-v d)
                       sql-table (join-table-name ctx mem-attr attr)
                       sql-col (column-name ctx mem-attr attr)
-                      sql-val (encode-value ctx (ctx-valueType ctx attr-id) value)]
+                      sql-val (encode-value ctx attr-id value)]
                   (if (-added? d)
                     [:upsert
                      {:table sql-table
@@ -347,31 +337,33 @@
                      :db.entity/preds
                      :db.attr/preds})
 
+;; MKHTODO
+;; Some simplifying assumptions we're making:
+;; 1. The membership attributes are never cardinality many attributes.
+;;    The peer implemetnation was able to consult the DB to determine if an attribute was new cheaply, but cloud cannot do that.
+;;    Instead we need to look at the transaction and assume that if there is no retraction in the same tx as an assertion for the
+;;    membership attribute, that means the entity is new. However, cardinality-many attributes can have that even after the first attribute.
+;;
+;; 2. Entities must carry the membership attribute on their first assertion.
+;;    That is, facts asserted in a TX before the membership attribute was given will not be synced to SQL.
+;;    This is because it is very expensive to go back and find all of those old datoms anytime a new entity shows up.
+
 (defn process-entity
   "Process the datoms within a transaction for a single entity. This checks all
   tables to see if the entity contains the membership attribute, if so
   operations get added under `:ops` to evolve the schema and insert the data."
-  [{:keys [tables] :as ctx} prev-db db eid datoms]
-  ;;(clojure.pprint/pprint ['process-entity eid datoms])
+  [{:keys [tables] :as ctx} eid datoms t]
   (reduce
    (fn [ctx [mem-attr table-opts]]
-     (if (or (has-attr? prev-db eid mem-attr)
-             (has-attr? db eid mem-attr))
+     ;;(prn "process-entity" eid mem-attr)
+     (if (some #(= mem-attr (ctx-ident ctx (-a %))) datoms) ;; One of the datoms is for the membership attribute of this table.  datoms)
        ;; Handle cardinality/one separate from cardinality/many
-       (let [datoms           (if (not (has-attr? prev-db eid mem-attr))
-                                ;; If after the previous transaction the
-                                ;; membership attribute wasn't there yet, then
-                                ;; it's added in this tx. In that case pull in
-                                ;; all pre-existing datoms for the entities,
-                                ;; they need to make across as well.
-                                (concat datoms (d/datoms prev-db :eavt eid))
-                                datoms)
-             datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
+       (let [datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
              card-one-datoms  (remove (fn [d] (ctx-card-many? ctx (-a d))) datoms)
              card-many-datoms (filter (fn [d] (ctx-card-many? ctx (-a d))) datoms)]
          (cond-> ctx
            (seq card-one-datoms)
-           (card-one-entity-ops mem-attr eid card-one-datoms)
+           (card-one-entity-ops mem-attr eid card-one-datoms t)
 
            (seq card-many-datoms)
            (card-many-entity-ops mem-attr eid card-many-datoms)))
@@ -384,15 +376,21 @@
   the `:ops` the operations needed to propagate the update, while also keeping
   the rest of the context (`ctx`) up to date, in particular by tracking any
   schema changes, or other changes involving `:db/ident`."
-  [ctx conn {:keys [t data]}]
-  (let [ctx (track-idents ctx data)
-        prev-db (d/as-of (d/db conn) (dec t))
-        db (d/as-of (d/db conn) t)
-        entities (group-by -e data)]
-    (reduce (fn [ctx [eid datoms]]
-              (process-entity ctx prev-db db eid datoms))
-            ctx
-            entities)))
+  [ctx {:keys [t data] :as tx}]
+  ;;(prn "process-tx" t data)
+  (try
+    (let [ctx (track-idents ctx data)
+          entities (group-by -e data)]
+
+      (reduce (fn [ctx [eid datoms]]
+                (process-entity ctx eid datoms t))
+              ctx
+              entities))
+    (catch Exception e
+      (prn "tx" tx)
+      (spit "error-ctx.edn" (pr-str ctx))
+      ;;(prn "ctx" ctx)
+      (prn e))))
 
 ;; Up to here we've only dealt with extracting information from datomic
 ;; transactions, and turning them into
@@ -506,10 +504,12 @@
                       (:db/id v))]
           id
           v))))
-   (d/q
-    '[:find [(pull ?e [*]) ...]
-      :where [?e :db/ident]]
-    db)))
+   (map first
+        (d/q
+    ;;'[:find [(pull ?e [*]) ...] ;; https://docs.datomic.com/pro/query/query.html#find-specifications - can be simulated with a (map first)
+         '[:find (pull ?e [*])
+           :where [?e :db/ident]]
+         db))))
 
 (defn initial-ctx
   "Create the context map that gets passed around all through the process,
@@ -518,15 +518,20 @@
   to be processed."
   ([conn metaschema]
    (initial-ctx conn metaschema nil))
-  ([conn metaschema t]
+  ([conn metaschema max-t]
    ;; Bootstrap, make sure we have info about idents that datomic creates itself
    ;; at db creation time. d/as-of t=999 is basically an empty database with only
    ;; metaschema attributes (:db/txInstant etc), since the first "real"
    ;; transaction is given t=1000. Interesting to note that Datomic seems to
    ;; bootstrap in pieces: t=0 most basic idents, t=57 add double, t=63 add
    ;; docstrings, ...
-   (let [idents (pull-idents (d/as-of (d/db conn) (or t 999)))]
+   (let [start-t (inc (or max-t 6)) ;; Cloud databases start at t=7. All prior attributes are for system datoms, and you'd be very unhappy trying to sync those.
+         end-t (:t (d/db conn))
+         idents (pull-idents (d/as-of (d/db conn) start-t))]
      {;; Track datomic schema
+      :start-t start-t
+      :end-t end-t
+      :start-time (.getTime (Date.))
       :entids (into {} (map (juxt :db/ident :db/id)) idents)
       :idents (into {} (map (juxt :db/id identity)) idents)
       ;; Configure/track relational schema
@@ -547,20 +552,50 @@
               :columns {:t {:name "t"
                             :type :bigint}}}]]})))
 
+
+(def report-frequency (* 1000 60 60 24)) ;; 1 day
+
+;; MKHTODO 
+;; * Package up for a direct deploy
+;; * Try it out in sandbox
+
+(defn maybe-report [{:keys [last-report start-time end-t start-t] :as ctx} tx]
+  (let [current-t (:t tx)
+        datoms (:data tx)
+        tx-date (-v (first (filter #(=  :db/txInstant (ctx-ident ctx (-a %))) datoms)))]
+    (if (and (not= current-t start-t)
+             (or (nil? last-report)
+                 ;; It's been awhile (30 seconds)
+                 (-> (Date.) (.getTime) (- (:time last-report)) (> 30000))
+                 ;; We're on a new day
+                 (> (- (.getTime ^java.util.Date tx-date) (.getTime ^java.util.Date (:tx-time last-report)))
+                    report-frequency)))
+      (let [progress-ratio (/ (float current-t) end-t)
+            progress-percent (* progress-ratio 100)
+            now (.getTime (Date.))
+            elapsed (- now start-time)
+            resume-adjusted-progress-ratio (/ (float (- current-t start-t)) (- end-t start-t)) ;; If we're resuming, then a ton of work was already done, and throws off estimates
+            estimated-total-elapsed (/ (float elapsed) resume-adjusted-progress-ratio)
+            remaining (- estimated-total-elapsed elapsed)]
+        (println (format "-> %1$tY-%1$tm-%1$td - progress %2$,d / %3$,d = %4$.1f%% Elapsed: %5$s Remaining: %6$s"
+                         tx-date current-t  end-t progress-percent
+                         (util/humanize-time-duration elapsed)
+                         (util/humanize-time-duration remaining)))
+        (assoc ctx :last-report {:tx-time tx-date :time (.getTime (Date.))}))
+      ctx)))
+
 (defn import-tx-range
   "Import a range of transactions (e.g. from [[d/tx-range]]) into the target
   database. Takes a `ctx` as per [[initial-ctx]], a datomic connection `conn`,
   and a JDBC datasource `ds`"
-  [ctx conn ds tx-range]
+  [ctx ds tx-range]
+  (prn "first" (first tx-range))
   (loop [ctx ctx
          [tx & txs] tx-range
          cnt 1]
-    (when (= (mod cnt 100) 0)
-      (print ".") (flush))
-    (when (= (mod cnt 1000) 0)
-      (println (str "\n" (java.time.Instant/now))) (flush))
     (if tx
-      (let [ctx (process-tx ctx conn tx)
+      (let [ctx (maybe-report ctx tx)
+            ctx (process-tx ctx tx)
             queries (eduction
                      (comp
                       (mapcat op->sql)
@@ -571,10 +606,14 @@
         ;; table. This allows us to see exactly which transactions have been
         ;; imported, and to resume work from there.
         (dbg 't '--> (:t tx))
-        (jdbc/with-transaction [jdbc-tx ds]
-          (run! dbg (:ops ctx))
-          (run! #(do (dbg %)
-                     (jdbc/execute! jdbc-tx %)) queries))
+        (try
+          (jdbc/with-transaction [jdbc-tx ds]
+            (run! dbg (:ops ctx))
+            (run! #(do (dbg %)
+                       (jdbc/execute! jdbc-tx %)) queries))
+          (catch Exception e
+            (spit "error-ctx.edn" (pr-str ctx))
+            (throw (ex-info "Failed to run sql" {:tx tx :ops (:ops ctx)} e))))
         (recur (dissoc ctx :ops) txs
                (inc cnt)))
       ctx)))
@@ -599,15 +638,19 @@
   (let [;; Find the most recent transaction that has been copied, or `nil` if this
         ;; is the first run
         max-t (find-max-t pg-conn)
-
         ;; Query the current datomic schema. Plenish will track schema changes as
         ;; it processes transcations, but it needs to know what the schema looks
         ;; like so far.
         ctx   (initial-ctx datomic-conn metaschema max-t)
+        _ (spit "start-ctx.edn" (pr-str ctx))
 
         ;; Grab the datomic transactions you want Plenish to process. This grabs
         ;; all transactions that haven't been processed yet.
-        txs   (d/tx-range (d/log datomic-conn) (when max-t (inc max-t)) nil)]
+        ;;txs   (d/tx-range (d/log datomic-conn) (when max-t (inc max-t)) nil)
+        txs (d/tx-range datomic-conn {:start (:start-t ctx)
+                                      :end (:end-t ctx)
+                                      :limit -1})]
 
     ;; Get to work
-    (import-tx-range ctx datomic-conn pg-conn txs)))
+    (import-tx-range ctx pg-conn txs)))
+

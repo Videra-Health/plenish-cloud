@@ -20,8 +20,8 @@
    :extra-deps  {lambdaisland/kaocha {:mvn/version "1.82.1306"}}}
 
   :postgresql
-  {:extra-deps {;; org.postgresql/postgresql {:mvn/version "42.4.0"}      ; "classic" pg jdbc driver
-                com.impossibl.pgjdbc-ng/pgjdbc-ng {:mvn/version "0.8.9"}  ; new generation driver
+  {:extra-deps {org.postgresql/postgresql {:mvn/version "42.4.0"}      ; "classic" pg jdbc driver
+                ;;com.impossibl.pgjdbc-ng/pgjdbc-ng {:mvn/version "0.8.9"}  ; new generation driver
                 }}
 
   :datomic-pro
