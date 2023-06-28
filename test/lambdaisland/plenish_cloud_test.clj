@@ -1,9 +1,9 @@
-(ns lambdaisland.plenish-test
+(ns lambdaisland.plenish-cloud-test
   (:require [clojure.test :refer :all]
             [datomic.api :as d]
             [lambdaisland.facai :as f]
-            [lambdaisland.plenish :as plenish]
-            [lambdaisland.plenish.factories :as factories]
+            [lambdaisland.plenish-cloud :as plenish]
+            [lambdaisland.plenish-cloud.factories :as factories]
             [lambdaisland.facai.datomic-peer :as fd]
             [clojure.instant :as inst]
             [next.jdbc :as jdbc]

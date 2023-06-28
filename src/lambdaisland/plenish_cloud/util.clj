@@ -1,4 +1,4 @@
-(ns lambdaisland.plenish.util)
+(ns lambdaisland.plenish-cloud.util)
 
 (defn humanize-time-duration
   "Takes an elapsed time in milliseconds and prints something readable by humans."

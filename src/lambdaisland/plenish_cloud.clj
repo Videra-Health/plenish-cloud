@@ -1,14 +1,12 @@
-(ns lambdaisland.plenish
+(ns lambdaisland.plenish-cloud
   "Transfer datomic data into a relational target database, transaction per
   transaction."
   (:require [charred.api :as charred]
             [clojure.string :as str]
             [datomic.client.api :as d]
             [honey.sql :as honey]
-            [lambdaisland.plenish.util :as util]
-            [honey.sql.helpers :as hh]
-            [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs])
+            [lambdaisland.plenish-cloud.util :as util]
+            [next.jdbc :as jdbc])
   (:import [java.util Date]))
 
 (set! *warn-on-reflection* true)

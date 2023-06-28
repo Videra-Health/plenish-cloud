@@ -1,4 +1,4 @@
-(ns lambdaisland.plenish.factories
+(ns lambdaisland.plenish-cloud.factories
   "Factories so we can easily populate some test dbs"
   (:require [lambdaisland.facai :as f]))
 

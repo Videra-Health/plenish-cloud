@@ -14,3 +14,7 @@ out
 .#*
 deps.local.edn
 musicbrainz
+.calva
+.clj-kondo
+.cpcache
+.lsp
