@@ -155,7 +155,8 @@
       ;; Handle non `[_ :db/ident _]` datoms
       ;; This fills in all of the facts about the attribute (e.g. :db/cardinality)
       ;; after the above created it in (:idents ctx)
-      ;; MKHTODO Would need to rename the column as well!!!! (right now the new column is created, the old one is deleted)
+      ;; Testing shows that the old column is deleted, the new column is created, and data in the old column is lost
+      ;; Not likely what we want, but could work for existing use cases
       (->> tx-rest
            (filter #(get-in ctx [:idents (-e %)]))
            util/remove-update-retracts ;; We run this a bit later rather than at the top for speed
@@ -337,7 +338,6 @@
                      :db.entity/preds
                      :db.attr/preds})
 
-;; MKHTODO
 ;; Some simplifying assumptions we're making:
 ;; 1. The membership attributes are never cardinality many attributes.
 ;;    The peer implemetnation was able to consult the DB to determine if an attribute was new cheaply, but cloud cannot do that.
@@ -555,10 +555,6 @@
 
 (def report-frequency (* 1000 60 60 24)) ;; 1 day
 
-;; MKHTODO 
-;; * Package up for a direct deploy
-;; * Try it out in sandbox
-
 (defn maybe-report [{:keys [last-report start-time end-t start-t] :as ctx} tx]
   (let [current-t (:t tx)
         datoms (:data tx)
@@ -589,7 +585,6 @@
   database. Takes a `ctx` as per [[initial-ctx]], a datomic connection `conn`,
   and a JDBC datasource `ds`"
   [ctx ds tx-range]
-  (prn "first" (first tx-range))
   (loop [ctx ctx
          [tx & txs] tx-range
          cnt 1]
