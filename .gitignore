@@ -18,3 +18,5 @@ musicbrainz
 .clj-kondo
 .cpcache
 .lsp
+*-ctx.edn
+metaschema.edn

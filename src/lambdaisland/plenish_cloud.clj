@@ -68,6 +68,17 @@
   [s]
   (str/replace s #"-" "_"))
 
+(defn has-attr?
+  "Does the entity `eid` have the attribute `attr` in the database `db`.
+
+  Uses direct index access so we can cheaply check if a give entity should be
+  added to a given table, based on a membership attribute."
+  [db eid attr]
+  (-> db
+      ^Iterable (d/datoms {:index :eavt :components [eid attr]})
+      .iterator
+      .hasNext))
+
 ;; A note on naming, PostgreSQL (our primary target) does not have the same
 ;; limitations on names that Presto has. We can use e.g. dashes just fine,
 ;; assuming names are properly quoted. We've still opted to use underscores by
@@ -336,6 +347,11 @@
                      :db.entity/preds
                      :db.attr/preds})
 
+(defn attrs-on-entity [db eid]
+  (->> (d/datoms db {:index :eavt :components [eid]})
+       (map :a)
+       set))
+
 ;; Some simplifying assumptions we're making:
 ;; 1. The membership attributes are never cardinality many attributes.
 ;;    The peer implemetnation was able to consult the DB to determine if an attribute was new cheaply, but cloud cannot do that.
@@ -350,38 +366,49 @@
   "Process the datoms within a transaction for a single entity. This checks all
   tables to see if the entity contains the membership attribute, if so
   operations get added under `:ops` to evolve the schema and insert the data."
-  [{:keys [tables] :as ctx} eid datoms t]
-  (reduce
-   (fn [ctx [mem-attr table-opts]]
-     ;;(prn "process-entity" eid mem-attr)
-     (if (some #(= mem-attr (ctx-ident ctx (-a %))) datoms) ;; One of the datoms is for the membership attribute of this table.  datoms)
-       ;; Handle cardinality/one separate from cardinality/many
-       (let [datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
-             card-one-datoms  (remove (fn [d] (ctx-card-many? ctx (-a d))) datoms)
-             card-many-datoms (filter (fn [d] (ctx-card-many? ctx (-a d))) datoms)]
-         (cond-> ctx
-           (seq card-one-datoms)
-           (card-one-entity-ops mem-attr eid card-one-datoms t)
+  [{:keys [tables] :as ctx} prev-db db eid datoms t]
+  (let [current-attrs (attrs-on-entity db eid)
+        prior-attrs (attrs-on-entity prev-db eid)]
+    (reduce
+     (fn [ctx [mem-attr _table-opts]]
 
-           (seq card-many-datoms)
-           (card-many-entity-ops mem-attr eid card-many-datoms)))
-       ctx))
-   ctx
-   tables))
+     ;; MKHTODO: The existing strategy of only worrying about the _x_ tables in card-many-entity-ops only works if the the memebership attribute is also in the transaction!!!
+     ;; We can likely fix this by putting the _x_ tables into the tables logic and searching for them up here in process-entity
+     ;; 
+     ;; Actually: The problem is that this is a bad replacement of https://github.com/lambdaisland/plenish/blob/main/src/lambdaisland/plenish.clj#L358C46-L358C46
+     ;; We need to know if the *database* has this entity, not if the *transaction* has this memebership entity.
+
+       (if (or (current-attrs mem-attr)
+               (prior-attrs mem-attr))
+       ;; Handle cardinality/one separate from cardinality/many
+         (let [datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
+               card-one-datoms  (remove (fn [d] (ctx-card-many? ctx (-a d))) datoms)
+               card-many-datoms (filter (fn [d] (ctx-card-many? ctx (-a d))) datoms)]
+           (cond-> ctx
+             (seq card-one-datoms)
+             (card-one-entity-ops mem-attr eid card-one-datoms t)
+
+             (seq card-many-datoms)
+             (card-many-entity-ops mem-attr eid card-many-datoms)))
+         ctx))
+     ctx
+     tables)))
 
 (defn process-tx
   "Handle a single datomic transaction, this will update the context, appending to
   the `:ops` the operations needed to propagate the update, while also keeping
   the rest of the context (`ctx`) up to date, in particular by tracking any
   schema changes, or other changes involving `:db/ident`."
-  [ctx {:keys [t data] :as tx}]
+  [ctx conn {:keys [t data] :as tx}]
   ;;(prn "process-tx" t data)
   (try
     (let [ctx (track-idents ctx data)
-          entities (group-by -e data)]
+          entities (group-by -e data)
+          prev-db (d/as-of (d/db conn) (dec t))
+          db (d/as-of (d/db conn) t)]
 
       (reduce (fn [ctx [eid datoms]]
-                (process-entity ctx eid datoms t))
+                (process-entity ctx prev-db db eid datoms t))
               ctx
               entities))
     (catch Exception e
@@ -523,12 +550,12 @@
    ;; transaction is given t=1000. Interesting to note that Datomic seems to
    ;; bootstrap in pieces: t=0 most basic idents, t=57 add double, t=63 add
    ;; docstrings, ...
-   (let [start-t (inc (or max-t 6)) ;; Cloud databases start at t=7. All prior attributes are for system datoms, and you'd be very unhappy trying to sync those.
+   (let [start-t (inc (or max-t 5)) ;; Cloud databases start at t=6. All prior attributes are for system datoms, and you'd be very unhappy trying to sync those.
          end-t (:t (d/db conn))
          idents (pull-idents (d/as-of (d/db conn) start-t))]
      {;; Track datomic schema
       :start-t start-t
-      :end-t end-t
+      :end-t end-t ;; Last transaction we'll process (inclusive)
       :start-time (.getTime (Date.))
       :entids (into {} (map (juxt :db/ident :db/id)) idents)
       :idents (into {} (map (juxt :db/id identity)) idents)
@@ -582,13 +609,13 @@
   "Import a range of transactions (e.g. from [[d/tx-range]]) into the target
   database. Takes a `ctx` as per [[initial-ctx]], a datomic connection `conn`,
   and a JDBC datasource `ds`"
-  [ctx ds tx-range]
+  [ctx conn ds tx-range]
   (loop [ctx ctx
          [tx & txs] tx-range
          cnt 1]
     (if tx
       (let [ctx (maybe-report ctx tx)
-            ctx (process-tx ctx tx)
+            ctx (process-tx ctx conn tx)
             queries (eduction
                      (comp
                       (mapcat op->sql)
@@ -641,9 +668,9 @@
         ;; all transactions that haven't been processed yet.
         ;;txs   (d/tx-range (d/log datomic-conn) (when max-t (inc max-t)) nil)
         txs (d/tx-range datomic-conn {:start (:start-t ctx)
-                                      :end (:end-t ctx)
+                                      :end (inc (:end-t ctx)) ;; :end is exclusive
                                       :limit -1})]
 
     ;; Get to work
-    (import-tx-range ctx pg-conn txs)))
+    (import-tx-range ctx datomic-conn pg-conn txs)))
 
