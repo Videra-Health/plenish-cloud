@@ -348,7 +348,7 @@
                      :db.attr/preds})
 
 (defn attrs-on-entity [db eid]
-  (->> (d/datoms db {:index :eavt :components [eid]})
+  (->> (d/datoms db {:index :eavt :components [eid] :limit -1})
        (map :a)
        set))
 
@@ -366,33 +366,27 @@
   "Process the datoms within a transaction for a single entity. This checks all
   tables to see if the entity contains the membership attribute, if so
   operations get added under `:ops` to evolve the schema and insert the data."
-  [{:keys [tables] :as ctx} prev-db db eid datoms t]
-  (let [current-attrs (attrs-on-entity db eid)
-        prior-attrs (attrs-on-entity prev-db eid)]
-    (reduce
-     (fn [ctx [mem-attr _table-opts]]
-
-     ;; MKHTODO: The existing strategy of only worrying about the _x_ tables in card-many-entity-ops only works if the the memebership attribute is also in the transaction!!!
-     ;; We can likely fix this by putting the _x_ tables into the tables logic and searching for them up here in process-entity
-     ;; 
-     ;; Actually: The problem is that this is a bad replacement of https://github.com/lambdaisland/plenish/blob/main/src/lambdaisland/plenish.clj#L358C46-L358C46
-     ;; We need to know if the *database* has this entity, not if the *transaction* has this memebership entity.
-
-       (if (or (current-attrs mem-attr)
-               (prior-attrs mem-attr))
+  [{:keys [tables] :as ctx} existing-attributes eid datoms t]
+  (reduce
+   (fn [ctx [mem-attr _table-opts]]
+     (if (or
+          ;; Pre-existing entities
+          (get existing-attributes [eid mem-attr])
+          ;; Or you're just now being created
+          (some #(= mem-attr (ctx-ident ctx (-a %))) datoms))
        ;; Handle cardinality/one separate from cardinality/many
-         (let [datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
-               card-one-datoms  (remove (fn [d] (ctx-card-many? ctx (-a d))) datoms)
-               card-many-datoms (filter (fn [d] (ctx-card-many? ctx (-a d))) datoms)]
-           (cond-> ctx
-             (seq card-one-datoms)
-             (card-one-entity-ops mem-attr eid card-one-datoms t)
+       (let [datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
+             card-one-datoms  (remove (fn [d] (ctx-card-many? ctx (-a d))) datoms)
+             card-many-datoms (filter (fn [d] (ctx-card-many? ctx (-a d))) datoms)]
+         (cond-> ctx
+           (seq card-one-datoms)
+           (card-one-entity-ops mem-attr eid card-one-datoms t)
 
-             (seq card-many-datoms)
-             (card-many-entity-ops mem-attr eid card-many-datoms)))
-         ctx))
-     ctx
-     tables)))
+           (seq card-many-datoms)
+           (card-many-entity-ops mem-attr eid card-many-datoms)))
+       ctx))
+   ctx
+   tables))
 
 (defn process-tx
   "Handle a single datomic transaction, this will update the context, appending to
@@ -405,10 +399,16 @@
     (let [ctx (track-idents ctx data)
           entities (group-by -e data)
           prev-db (d/as-of (d/db conn) (dec t))
-          db (d/as-of (d/db conn) t)]
-
+          existing-attributes (->> (d/q '[:find ?e ?a
+                                          :in $ [?e ...]
+                                          :where [?e ?a]]
+                                        prev-db (keys entities))
+                                   (group-by first)
+                                   (map (fn [[e attrs]]
+                                          [e (set (map second attrs))]))
+                                   (into {}))]
       (reduce (fn [ctx [eid datoms]]
-                (process-entity ctx prev-db db eid datoms t))
+                (process-entity ctx existing-attributes eid datoms t))
               ctx
               entities))
     (catch Exception e
@@ -536,6 +536,16 @@
            :where [?e :db/ident]]
          db))))
 
+(defn find-first-tx
+  "Cloud databases start at t=6. All prior attributes are for system datoms, and you'd be very unhappy trying to sync those."
+  [conn]
+  (->>
+   (d/tx-range conn {:start 5 ;; It's never before 10
+                     :limit 10}) ;; It's always within the first 15 datoms
+   (remove (fn [{:keys [data]}] (some #(= 0 (:e %)) data)))
+   first
+   :t))
+
 (defn initial-ctx
   "Create the context map that gets passed around all through the process,
   contains both caches for quick lookup of datomic schema information,
@@ -550,7 +560,7 @@
    ;; transaction is given t=1000. Interesting to note that Datomic seems to
    ;; bootstrap in pieces: t=0 most basic idents, t=57 add double, t=63 add
    ;; docstrings, ...
-   (let [start-t (inc (or max-t 5)) ;; Cloud databases start at t=6. All prior attributes are for system datoms, and you'd be very unhappy trying to sync those.
+   (let [start-t (if max-t (inc max-t) (find-first-tx conn))
          end-t (:t (d/db conn))
          idents (pull-idents (d/as-of (d/db conn) start-t))]
      {;; Track datomic schema
