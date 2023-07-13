@@ -371,7 +371,7 @@
    (fn [ctx [mem-attr _table-opts]]
      (if (or
           ;; Pre-existing entities
-          (get existing-attributes [eid mem-attr])
+          (get existing-attributes mem-attr)
           ;; Or you're just now being created
           (some #(= mem-attr (ctx-ident ctx (-a %))) datoms))
        ;; Handle cardinality/one separate from cardinality/many
@@ -405,10 +405,10 @@
                                         prev-db (keys entities))
                                    (group-by first)
                                    (map (fn [[e attrs]]
-                                          [e (set (map second attrs))]))
+                                          [e (set (map (comp (partial ctx-ident ctx) second) attrs))]))
                                    (into {}))]
       (reduce (fn [ctx [eid datoms]]
-                (process-entity ctx existing-attributes eid datoms t))
+                (process-entity ctx (get existing-attributes eid) eid datoms t))
               ctx
               entities))
     (catch Exception e
