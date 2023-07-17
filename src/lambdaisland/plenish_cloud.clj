@@ -254,7 +254,14 @@
                                      ;; membership attribute
                                      (and (-added? d)
                                           (= mem-attr (ctx-ident ctx (-a d)))))
-                                   datoms)))]
+                                   datoms)))
+        table (table-name ctx mem-attr)
+        ;; Note, it is possible to have a change to a prior transaction that itself is not a transaction!
+        new-transaction? (and (= "transactions" table)
+                              (some (fn [d]
+                                      (and (= :db/txInstant (-a d))
+                                           (-added? d)))
+                                    datoms))]
     ;;(clojure.pprint/pprint ['card-one-entity-ops mem-attr eid datoms retracted?])
     (cond-> ctx
       ;; Evolve the schema
@@ -262,7 +269,7 @@
       (-> (update :ops
                   (fnil conj [])
                   [:ensure-columns
-                   {:table   (table-name ctx mem-attr)
+                   {:table   table
                     :columns (into {} missing-cols)}])
           (update-in [:tables mem-attr :columns] (fnil into {}) missing-cols))
       ;; Delete/insert values
@@ -270,23 +277,22 @@
       (update :ops (fnil conj [])
               (if retracted?
                 [:delete
-                 {:table  (table-name ctx mem-attr)
+                 {:table  table
                   :values {"db__id" eid}}]
-                (let [table (table-name ctx mem-attr)]
-                  [(if (= "transactions" table)
-                     :insert
-                     :upsert)
-                   {:table table
-                    :by #{"db__id"}
-                    :values (into (cond-> {"db__id" eid}
+                [(if new-transaction?
+                   :insert
+                   :upsert)
+                 {:table table
+                  :by #{"db__id"}
+                  :values (into (cond-> {"db__id" eid}
                                     ;; Bit of manual fudgery to also get the "t"
                                     ;; value of each transaction into
                                     ;; our "transactions" table.
-                                    (= :db/txInstant mem-attr) (assoc "t" t))
-                                  (map (juxt #(column-name ctx mem-attr (ctx-ident ctx (-a %)))
-                                             #(when (-added? %)
-                                                (encode-value ctx (-a %) (-v %)))))
-                                  datoms)}]))))))
+                                  new-transaction? (assoc "t" t))
+                                (map (juxt #(column-name ctx mem-attr (ctx-ident ctx (-a %)))
+                                           #(when (-added? %)
+                                              (encode-value ctx (-a %) (-v %)))))
+                                datoms)}])))))
 
 (defn card-many-entity-ops
   "Add operations `:ops` to the context for all the `cardinality/many` datoms in a
@@ -643,7 +649,11 @@
                        (jdbc/execute! jdbc-tx %)) queries))
           (catch Exception e
             (spit "error-ctx.edn" (pr-str ctx))
-            (throw (ex-info "Failed to run sql" {:tx tx :ops (:ops ctx)} e))))
+            (throw (ex-info "Failed to run sql" {:tx tx
+                                                 :ops (:ops ctx)
+                                                 :queries queries}
+                            e))))
+
         (recur (dissoc ctx :ops) txs
                (inc cnt)))
       ctx)))
