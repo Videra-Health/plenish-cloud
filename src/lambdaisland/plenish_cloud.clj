@@ -373,6 +373,8 @@
   tables to see if the entity contains the membership attribute, if so
   operations get added under `:ops` to evolve the schema and insert the data."
   [{:keys [tables] :as ctx} prev-db existing-attributes eid datoms t]
+  {:pre [(some? ctx) (some? prev-db)]
+   :post [(some? %)]}
   (reduce
    (fn [ctx [mem-attr _table-opts]]
      (if (or
@@ -389,7 +391,6 @@
                                              ;; they need to make across as well.
                       (concat datoms (d/datoms prev-db {:index :eavt :components [eid]}))
                       datoms)
-
              datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
              card-one-datoms  (remove (fn [d] (ctx-card-many? ctx (-a d))) datoms)
              card-many-datoms (filter (fn [d] (ctx-card-many? ctx (-a d))) datoms)]
@@ -423,7 +424,7 @@
                                           [e (set (map (comp (partial ctx-ident ctx) second) attrs))]))
                                    (into {}))]
       (reduce (fn [ctx [eid datoms]]
-                (process-entity ctx (get existing-attributes eid) prev-db eid datoms t))
+                (process-entity ctx prev-db (get existing-attributes eid) eid datoms t))
               ctx
               entities))
     (catch Exception e
@@ -606,6 +607,7 @@
 (def report-frequency (* 1000 60 60 24)) ;; 1 day
 
 (defn maybe-report [{:keys [last-report start-time end-t start-t] :as ctx} tx]
+  {:pre [(some? ctx)]}
   (let [current-t (:t tx)
         datoms (:data tx)
         tx-date (-v (first (filter #(=  :db/txInstant (ctx-ident ctx (-a %))) datoms)))]
