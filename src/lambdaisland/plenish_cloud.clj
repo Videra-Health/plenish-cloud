@@ -259,7 +259,7 @@
         ;; Note, it is possible to have a change to a prior transaction that itself is not a transaction!
         new-transaction? (and (= "transactions" table)
                               (some (fn [d]
-                                      (and (= :db/txInstant (-a d))
+                                      (and (= :db/txInstant (ctx-ident ctx (-a d)))
                                            (-added? d)))
                                     datoms))]
     ;;(clojure.pprint/pprint ['card-one-entity-ops mem-attr eid datoms retracted?])
@@ -372,7 +372,7 @@
   "Process the datoms within a transaction for a single entity. This checks all
   tables to see if the entity contains the membership attribute, if so
   operations get added under `:ops` to evolve the schema and insert the data."
-  [{:keys [tables] :as ctx} existing-attributes eid datoms t]
+  [{:keys [tables] :as ctx} prev-db existing-attributes eid datoms t]
   (reduce
    (fn [ctx [mem-attr _table-opts]]
      (if (or
@@ -381,7 +381,16 @@
           ;; Or you're just now being created
           (some #(= mem-attr (ctx-ident ctx (-a %))) datoms))
        ;; Handle cardinality/one separate from cardinality/many
-       (let [datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
+       (let [datoms (if (not (get existing-attributes mem-attr))
+                                             ;; If after the previous transaction the
+                                             ;; membership attribute wasn't there yet, then
+                                             ;; it's added in this tx. In that case pull in
+                                             ;; all pre-existing datoms for the entities,
+                                             ;; they need to make across as well.
+                      (concat datoms (d/datoms prev-db :eavt eid))
+                      datoms)
+
+             datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
              card-one-datoms  (remove (fn [d] (ctx-card-many? ctx (-a d))) datoms)
              card-many-datoms (filter (fn [d] (ctx-card-many? ctx (-a d))) datoms)]
          (cond-> ctx
@@ -414,7 +423,7 @@
                                           [e (set (map (comp (partial ctx-ident ctx) second) attrs))]))
                                    (into {}))]
       (reduce (fn [ctx [eid datoms]]
-                (process-entity ctx (get existing-attributes eid) eid datoms t))
+                (process-entity ctx (get existing-attributes eid) prev-db eid datoms t))
               ctx
               entities))
     (catch Exception e
