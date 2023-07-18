@@ -387,7 +387,7 @@
                                              ;; it's added in this tx. In that case pull in
                                              ;; all pre-existing datoms for the entities,
                                              ;; they need to make across as well.
-                      (concat datoms (d/datoms prev-db :eavt eid))
+                      (concat datoms (d/datoms prev-db {:index :eavt :components [eid]}))
                       datoms)
 
              datoms           (remove (fn [d] (contains? ignore-idents (ctx-ident ctx (-a d)))) datoms)
