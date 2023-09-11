@@ -552,16 +552,6 @@
            :where [?e :db/ident]]
          db))))
 
-(defn find-first-tx
-  "Cloud databases start at t=6. All prior attributes are for system datoms, and you'd be very unhappy trying to sync those."
-  [conn]
-  (->>
-   (d/tx-range conn {:start 5 ;; It's never before 10
-                     :limit 10}) ;; It's always within the first 15 datoms
-   (remove (fn [{:keys [data]}] (some #(= 0 (:e %)) data)))
-   first
-   :t))
-
 (defn initial-ctx
   "Create the context map that gets passed around all through the process,
   contains both caches for quick lookup of datomic schema information,
@@ -576,7 +566,7 @@
    ;; transaction is given t=1000. Interesting to note that Datomic seems to
    ;; bootstrap in pieces: t=0 most basic idents, t=57 add double, t=63 add
    ;; docstrings, ...
-   (let [start-t (if max-t (inc max-t) (find-first-tx conn))
+   (let [start-t (if max-t (inc max-t) 6) ;; New databases always start at t=6
          end-t (:t (d/db conn))
          idents (pull-idents (d/as-of (d/db conn) start-t))]
      {;; Track datomic schema
@@ -698,9 +688,12 @@
         ;; Grab the datomic transactions you want Plenish to process. This grabs
         ;; all transactions that haven't been processed yet.
         ;;txs   (d/tx-range (d/log datomic-conn) (when max-t (inc max-t)) nil)
-        txs (d/tx-range datomic-conn {:start (:start-t ctx)
-                                      :end (inc (:end-t ctx)) ;; :end is exclusive
-                                      :limit -1})]
+        txs (->> (d/tx-range datomic-conn {:start (:start-t ctx)
+                                           :end (inc (:end-t ctx)) ;; :end is exclusive
+                                           :limit -1})
+                 ;; Remove datoms recording to the partition. They confused plenish
+                 (map (fn [tx] (update tx :data (fn [data]
+                                                  (remove #(-> % :e (= 0)) data))))))]
 
     ;; Get to work
     (import-tx-range ctx datomic-conn pg-conn txs)))
