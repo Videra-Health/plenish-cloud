@@ -666,8 +666,8 @@
         (try
           (jdbc/with-transaction [jdbc-tx ds]
             (run! dbg (:ops ctx))
-            #_(run! #(do (dbg %)
-                         (jdbc/execute! jdbc-tx %)) queries))
+            (run! #(do (dbg %)
+                       (jdbc/execute! jdbc-tx %)) queries))
           (catch Exception e
             (spit "error-ctx.edn" (pr-str ctx))
             (throw (ex-info "Failed to run sql" {:tx tx
