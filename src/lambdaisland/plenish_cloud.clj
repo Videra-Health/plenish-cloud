@@ -5,6 +5,7 @@
             [clojure.string :as str]
             [datomic.client.api :as d]
             [honey.sql :as honey]
+            [lambdaisland.plenish-cloud.errors :as errors]
             [lambdaisland.plenish-cloud.util :as util]
             [next.jdbc :as jdbc])
   (:import [java.util Date]))
@@ -650,34 +651,35 @@
   (loop [ctx ctx
          [tx & txs] tx-range
          cnt 1]
-    (if tx
-      (let [ctx (maybe-report ctx tx)
-            ctx (process-tx ctx conn tx)
-            queries (eduction
-                     (comp
-                      (mapcat op->sql)
-                      (map #(honey/format % {:quoted true})))
-                     (:ops ctx))]
+    (errors/with-error-info {:t (:t tx)}
+      (if tx
+        (let [ctx (maybe-report ctx tx)
+              ctx (process-tx ctx conn tx)
+              queries (eduction
+                       (comp
+                        (mapcat op->sql)
+                        (map #(honey/format % {:quoted true})))
+                       (:ops ctx))]
         ;; Each datomic transaction gets committed within a separate JDBC
         ;; transaction, and this includes adding an entry to the "transactions"
         ;; table. This allows us to see exactly which transactions have been
         ;; imported, and to resume work from there.
-        (dbg 't '--> (:t tx))
-        (try
-          (jdbc/with-transaction [jdbc-tx ds]
-            (run! dbg (:ops ctx))
-            (run! #(do (dbg %)
-                       (jdbc/execute! jdbc-tx %)) queries))
-          (catch Exception e
-            (spit "error-ctx.edn" (pr-str ctx))
-            (throw (ex-info "Failed to run sql" {:tx tx
-                                                 :ops (:ops ctx)
-                                                 :queries queries}
-                            e))))
+          (dbg 't '--> (:t tx))
+          (try
+            (jdbc/with-transaction [jdbc-tx ds]
+              (run! dbg (:ops ctx))
+              (run! #(do (dbg %)
+                         (jdbc/execute! jdbc-tx %)) queries))
+            (catch Exception e
+              (spit "error-ctx.edn" (pr-str ctx))
+              (throw (ex-info "Failed to run sql" {:tx tx
+                                                   :ops (:ops ctx)
+                                                   :queries queries}
+                              e))))
 
-        (recur (dissoc ctx :ops) txs
-               (inc cnt)))
-      ctx)))
+          (recur (dissoc ctx :ops) txs
+                 (inc cnt)))
+        ctx))))
 
 (defn find-max-t
   "Find the highest value in the transactions table in postgresql. The sync should
