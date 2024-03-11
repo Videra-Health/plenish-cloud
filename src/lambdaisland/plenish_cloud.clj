@@ -730,7 +730,9 @@
                                                 :where
                                                 [?e ?attr ?val ?tx]]
                                               (d/db datomic-conn) missed-attr))
-                          max-t (dec (tx->t datomic-conn min-tx))] max-t))
+                          _ (prn "Having to search for tx...")
+                          max-t (dec (tx->t datomic-conn min-tx))
+                          _ (prn "Found t=" max-t)] max-t))
         ctx   (-> (initial-ctx datomic-conn metaschema max-t)
                   ;; The transactions and idents tables will have already been written to, so trying to re-write to them will be redundant
                   (update :tables dissoc :db/txInstant)
