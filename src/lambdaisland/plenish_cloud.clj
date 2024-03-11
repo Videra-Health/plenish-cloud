@@ -79,6 +79,25 @@
       .iterator
       .hasNext))
 
+(defn tx->t
+  "Finds the transaction t for the given tx entity id.
+   This is fairly slow (about a minute) and I'm not certain how it will scale."
+  [conn desired-tx-id]
+  (let [db (d/db conn)
+        desired-tx-date (.getTime (:db/txInstant (d/pull db '[:db/txInstant] desired-tx-id)))]
+    (loop [low-t 6 high-t (:t db)]
+      (if (> low-t high-t)
+        nil ;; tx not found
+        (let [mid-t (quot (+ low-t high-t) 2)
+              {:keys [t data]} (first (d/tx-range conn {:start mid-t :limit 1}))
+              mid-tx-date-attr (->> data (filter #(-> % :a (= 50))) first)
+              mid-tx-date (-> mid-tx-date-attr :v (.getTime))
+              mid-tx-id (:e mid-tx-date-attr)]
+          (dbg 'tx->t mid-t (- high-t low-t))
+          (cond (= mid-tx-id desired-tx-id) mid-t
+                (< mid-tx-date desired-tx-date) (recur (inc mid-t) high-t)
+                (> mid-tx-date desired-tx-date) (recur low-t (dec mid-t))))))))
+
 ;; A note on naming, PostgreSQL (our primary target) does not have the same
 ;; limitations on names that Presto has. We can use e.g. dashes just fine,
 ;; assuming names are properly quoted. We've still opted to use underscores by
@@ -181,7 +200,6 @@
                    ctx)))))
 
 (def pg-min-date -210898425600000)
-
 (def pg-max-date 9224286307200000)
 
 (defn encode-value
@@ -556,7 +574,9 @@
   "Create the context map that gets passed around all through the process,
   contains both caches for quick lookup of datomic schema information,
   configuration regarding tables and target db, and eventually `:ops` that need
-  to be processed."
+  to be processed.
+   max-t: The maximum t that has previously been seen. We'll start at the next t after this. If nil, we'll start at the beginning of the db
+   "
   ([conn metaschema]
    (initial-ctx conn metaschema nil))
   ([conn metaschema max-t]
@@ -646,8 +666,8 @@
         (try
           (jdbc/with-transaction [jdbc-tx ds]
             (run! dbg (:ops ctx))
-            (run! #(do (dbg %)
-                       (jdbc/execute! jdbc-tx %)) queries))
+            #_(run! #(do (dbg %)
+                         (jdbc/execute! jdbc-tx %)) queries))
           (catch Exception e
             (spit "error-ctx.edn" (pr-str ctx))
             (throw (ex-info "Failed to run sql" {:tx tx
@@ -691,10 +711,36 @@
         txs (->> (d/tx-range datomic-conn {:start (:start-t ctx)
                                            :end (inc (:end-t ctx)) ;; :end is exclusive
                                            :limit -1})
-                 ;; Remove datoms recording to the partition. They confused plenish
+                 ;; Remove datoms recording to the partition. They confuse plenish
                  (map (fn [tx] (update tx :data (fn [data]
                                                   (remove #(-> % :e (= 0)) data))))))]
 
     ;; Get to work
     (import-tx-range ctx datomic-conn pg-conn txs)))
 
+(defn add-missed-table
+  "Convenience function that will add a table to that was missed in a prior executions (normally b/c it wasn't in the metaschema).
+   missed-attr: The key attribute from a metaschema corresponding to the forgotten table"
+  [datomic-conn pg-conn metaschema missed-attr t]
+  (let [;; A rebuilt metaschema containing *only* the table we missed
+        metaschema {:tables {missed-attr (-> metaschema :tables missed-attr)}}
+        ;; Earlist transaction where that attribute was used
+        max-t (or t (let [min-tx (ffirst (d/q '[:find (min ?tx)
+                                                :in $ ?attr
+                                                :where
+                                                [?e ?attr ?val ?tx]]
+                                              (d/db datomic-conn) missed-attr))
+                          max-t (dec (tx->t datomic-conn min-tx))] max-t))
+        ctx   (-> (initial-ctx datomic-conn metaschema max-t)
+                  ;; The transactions and idents tables will have already been written to, so trying to re-write to them will be redundant
+                  (update :tables dissoc :db/txInstant)
+                  (update :tables dissoc :db/ident))
+        _ (spit "start-ctx.edn" (pr-str ctx))
+        txs (->> (d/tx-range datomic-conn {:start (:start-t ctx)
+                                           :end (inc (:end-t ctx)) ;; :end is exclusive
+                                           :limit -1})
+                 ;; Remove datoms recording to the partition. They confuse plenish
+                 (map (fn [tx] (update tx :data (fn [data]
+                                                  (remove #(-> % :e (= 0)) data))))))]
+    ;; Get to work
+    (import-tx-range ctx datomic-conn pg-conn txs)))

@@ -23,9 +23,8 @@
 
 (defn remove-update-retracts
   "The transaction log will record a false then true assertion for updates to an already-existing cardinality-one datoms.
-   Some of the algorithms are simpler if that felse isn't present, and can thus assume that any retraction
-   is a true deletion.
-   Does not work well for cardinality-many attributes."
+   Some of the algorithms are simpler if that false isn't present, because they can assume that any retraction is a true deletion.
+   Not for cardinality-many attributes."
   [datoms]
   (let [have-positive-assertions (->> datoms
                                       (filter :added)
@@ -33,6 +32,5 @@
     (remove (fn [datom]
               (and
                (-> datom :added not)
-               ;;(-> datom :a cardinality-many-attr-ids not) We don't need to support cardinality many for now
                (-> datom index-datom-by-eid-attrid have-positive-assertions)))
             datoms)))
