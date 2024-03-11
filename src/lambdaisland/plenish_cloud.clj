@@ -451,7 +451,7 @@
       (prn "tx" tx)
       (spit "error-ctx.edn" (pr-str (assoc ctx :t t)))
       (throw e))))
-
+      
 ;; Up to here we've only dealt with extracting information from datomic
 ;; transactions, and turning them into
 ;; abstract "ops" (:ensure-columns, :upsert, :delete, etc). So this is all

@@ -12,7 +12,7 @@
 (defmacro with-error-info
   "Macro to execute the given block, but wrap any exceptions with additional metadata.
    The error is still thrown."
-  [msg info & body]
+  [info & body]
   `(try ~@body
         (catch Throwable e#
-          (throw (ex-info ~msg ~info e#)))))
+          (throw (ex-info (ex-message e#) ~info e#)))))
