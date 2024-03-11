@@ -431,26 +431,26 @@
   [ctx conn {:keys [t data] :as tx}]
   ;;(prn "process-tx" t data)
   (try
-    (let [ctx (track-idents ctx data)
-          entities (group-by -e data)
-          prev-db (d/as-of (d/db conn) (dec t))
-          existing-attributes (->> (d/q '[:find ?e ?a
-                                          :in $ [?e ...]
-                                          :where [?e ?a]]
-                                        prev-db (keys entities))
-                                   (group-by first)
-                                   (map (fn [[e attrs]]
-                                          [e (set (map (comp (partial ctx-ident ctx) second) attrs))]))
-                                   (into {}))]
-      (reduce (fn [ctx [eid datoms]]
-                (process-entity ctx prev-db (get existing-attributes eid) eid datoms t))
-              ctx
-              entities))
+    (errors/with-error-info {:t t}
+      (let [ctx (track-idents ctx data)
+            entities (group-by -e data)
+            prev-db (d/as-of (d/db conn) (dec t))
+            existing-attributes (->> (d/q '[:find ?e ?a
+                                            :in $ [?e ...]
+                                            :where [?e ?a]]
+                                          prev-db (keys entities))
+                                     (group-by first)
+                                     (map (fn [[e attrs]]
+                                            [e (set (map (comp (partial ctx-ident ctx) second) attrs))]))
+                                     (into {}))]
+        (reduce (fn [ctx [eid datoms]]
+                  (process-entity ctx prev-db (get existing-attributes eid) eid datoms t))
+                ctx
+                entities)))
     (catch Exception e
       (prn "tx" tx)
-      (spit "error-ctx.edn" (pr-str ctx))
-      ;;(prn "ctx" ctx)
-      (prn e))))
+      (spit "error-ctx.edn" (pr-str (assoc ctx :t t)))
+      (throw e))))
 
 ;; Up to here we've only dealt with extracting information from datomic
 ;; transactions, and turning them into
@@ -651,35 +651,34 @@
   (loop [ctx ctx
          [tx & txs] tx-range
          cnt 1]
-    (errors/with-error-info {:t (:t tx)}
-      (if tx
-        (let [ctx (maybe-report ctx tx)
-              ctx (process-tx ctx conn tx)
-              queries (eduction
-                       (comp
-                        (mapcat op->sql)
-                        (map #(honey/format % {:quoted true})))
-                       (:ops ctx))]
+    (if tx
+      (let [ctx (maybe-report ctx tx)
+            ctx (process-tx ctx conn tx)
+            queries (eduction
+                     (comp
+                      (mapcat op->sql)
+                      (map #(honey/format % {:quoted true})))
+                     (:ops ctx))]
         ;; Each datomic transaction gets committed within a separate JDBC
         ;; transaction, and this includes adding an entry to the "transactions"
         ;; table. This allows us to see exactly which transactions have been
         ;; imported, and to resume work from there.
-          (dbg 't '--> (:t tx))
-          (try
-            (jdbc/with-transaction [jdbc-tx ds]
-              (run! dbg (:ops ctx))
-              (run! #(do (dbg %)
-                         (jdbc/execute! jdbc-tx %)) queries))
-            (catch Exception e
-              (spit "error-ctx.edn" (pr-str ctx))
-              (throw (ex-info "Failed to run sql" {:tx tx
-                                                   :ops (:ops ctx)
-                                                   :queries queries}
-                              e))))
+        (dbg 't '--> (:t tx))
+        (try
+          (jdbc/with-transaction [jdbc-tx ds]
+            (run! dbg (:ops ctx))
+            (run! #(do (dbg %)
+                       (jdbc/execute! jdbc-tx %)) queries))
+          (catch Exception e
+            (spit "error-ctx.edn" (pr-str ctx))
+            (throw (ex-info "Failed to run sql" {:tx tx
+                                                 :ops (:ops ctx)
+                                                 :queries queries}
+                            e))))
 
-          (recur (dissoc ctx :ops) txs
-                 (inc cnt)))
-        ctx))))
+        (recur (dissoc ctx :ops) txs
+               (inc cnt)))
+      ctx)))
 
 (defn find-max-t
   "Find the highest value in the transactions table in postgresql. The sync should
