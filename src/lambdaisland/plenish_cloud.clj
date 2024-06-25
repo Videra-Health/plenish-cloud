@@ -6,6 +6,7 @@
             [datomic.client.api :as d]
             [honey.sql :as honey]
             [lambdaisland.plenish-cloud.errors :as errors]
+            [lambdaisland.plenish-cloud.queries :as queries]
             [lambdaisland.plenish-cloud.util :as util]
             [next.jdbc :as jdbc])
   (:import [java.util Date]))
@@ -64,10 +65,7 @@
   [ctx attr-id]
   (= :db.cardinality/many (ctx-cardinality ctx attr-id)))
 
-(defn dash->underscore
-  "Replace dashes with underscores in string s"
-  [s]
-  (str/replace s #"-" "_"))
+
 
 (defn has-attr?
   "Does the entity `eid` have the attribute `attr` in the database `db`.
@@ -80,63 +78,6 @@
       .iterator
       .hasNext))
 
-(defn tx->t
-  "Finds the transaction t for the given tx entity id.
-   This is fairly slow (about a minute) and I'm not certain how it will scale."
-  [conn desired-tx-id]
-  (let [db (d/db conn)
-        desired-tx-date (.getTime (:db/txInstant (d/pull db '[:db/txInstant] desired-tx-id)))]
-    (loop [low-t 6 high-t (:t db)]
-      (if (> low-t high-t)
-        nil ;; tx not found
-        (let [mid-t (quot (+ low-t high-t) 2)
-              {:keys [t data]} (first (d/tx-range conn {:start mid-t :limit 1}))
-              mid-tx-date-attr (->> data (filter #(-> % :a (= 50))) first)
-              mid-tx-date (-> mid-tx-date-attr :v (.getTime))
-              mid-tx-id (:e mid-tx-date-attr)]
-          (dbg 'tx->t mid-t (- high-t low-t))
-          (cond (= mid-tx-id desired-tx-id) mid-t
-                (< mid-tx-date desired-tx-date) (recur (inc mid-t) high-t)
-                (> mid-tx-date desired-tx-date) (recur low-t (dec mid-t))))))))
-
-;; A note on naming, PostgreSQL (our primary target) does not have the same
-;; limitations on names that Presto has. We can use e.g. dashes just fine,
-;; assuming names are properly quoted. We've still opted to use underscores by
-;; default, to make ad-hoc querying easier (quoting will often not be
-;; necessary), and to have largely the same table structure as datomic
-;; analytics, to make querying easier.
-;;
-;; That said we don't munge anything else (like a trailing `?` and `!`), and do
-;; rely on PostgreSQL quoting to handle these.
-
-(defn table-name
-  "Find a table name for a given table based on its membership attribute, either
-  as configured in the metaschema (`:name`), or derived from the namespace of
-  the membership attribute."
-  [ctx mem-attr]
-  (get-in ctx
-          [:tables mem-attr :name]
-          (dash->underscore (namespace mem-attr))))
-
-(defn join-table-name
-  "Find a table name for a join table, i.e. a table that is created because of a
-  cardinality/many attribute, given the membership attribute of the base table,
-  and the cardinality/many attribute. Either returns a name as configured in the
-  metaschema under `:rename-many-table`, or derives a name as
-  `namespace_mem_attr_x_name_val_attr`."
-  [ctx mem-attr val-attr]
-  (get-in ctx
-          [:tables mem-attr :rename-many-table val-attr]
-          (dash->underscore (str (table-name ctx mem-attr) "_x_" (name val-attr)))))
-
-(defn column-name
-  "Find a name for a column based on the table membership attribute, and the
-  attribute whose values are to be stored in the column."
-  [ctx mem-attr col-attr]
-  ;;{:pre [(some? col-attr)]}
-  (get-in ctx
-          [:tables mem-attr :rename col-attr]
-          (dash->underscore (name col-attr))))
 
 (defn attr-db-type
   "Get the target db type for the given attribute."
@@ -257,7 +198,7 @@
                        (map (fn [attr-id]
                               (let [attr (ctx-ident ctx attr-id)]
                                 [attr
-                                 {:name (column-name ctx mem-attr attr)
+                                 {:name (util/column-name ctx mem-attr attr)
                                   :type (attr-db-type ctx attr-id)}]))))
                       datoms)
         ;; Do we need to delete the row corresponding with this entity.
@@ -274,7 +215,7 @@
                                      (and (-added? d)
                                           (= mem-attr (ctx-ident ctx (-a d)))))
                                    datoms)))
-        table (table-name ctx mem-attr)
+        table (util/table-name ctx mem-attr)
         ;; Note, it is possible to have a change to a prior transaction that itself is not a transaction!
         new-transaction? (and (= "transactions" table)
                               (some (fn [d]
@@ -308,7 +249,7 @@
                                     ;; value of each transaction into
                                     ;; our "transactions" table.
                                   new-transaction? (assoc "t" t))
-                                (map (juxt #(column-name ctx mem-attr (ctx-ident ctx (-a %)))
+                                (map (juxt #(util/column-name ctx mem-attr (ctx-ident ctx (-a %)))
                                            #(when (-added? %)
                                               (encode-value ctx (-a %) (-v %)))))
                                 datoms)}])))))
@@ -327,7 +268,7 @@
                         (map (fn [attr-id]
                                (let [attr (ctx-ident ctx attr-id)]
                                  [attr
-                                  {:name (column-name ctx mem-attr attr)
+                                  {:name (util/column-name ctx mem-attr attr)
                                    :type (attr-db-type ctx attr-id)}]))))
                        datoms)]
     (cond-> ctx
@@ -336,10 +277,10 @@
                   (fnil into [])
                   (for [[val-attr join-opts] missing-joins]
                     [:ensure-join
-                     {:table (join-table-name ctx mem-attr val-attr)
-                      :fk-table (table-name ctx mem-attr)
+                     {:table (util/join-table-name ctx mem-attr val-attr)
+                      :fk-table (util/table-name ctx mem-attr)
                       :val-attr val-attr
-                      :val-col (column-name ctx mem-attr val-attr)
+                      :val-col (util/column-name ctx mem-attr val-attr)
                       :val-type (:type join-opts)}]))
           (update-in [:tables mem-attr :join-tables] (fnil into {}) missing-joins))
       :->
@@ -349,8 +290,8 @@
                 (let [attr-id (-a d)
                       attr (ctx-ident ctx attr-id)
                       value (-v d)
-                      sql-table (join-table-name ctx mem-attr attr)
-                      sql-col (column-name ctx mem-attr attr)
+                      sql-table (util/join-table-name ctx mem-attr attr)
+                      sql-col (util/column-name ctx mem-attr attr)
                       sql-val (encode-value ctx attr-id value)]
                   (if (-added? d)
                     [:upsert
@@ -451,7 +392,7 @@
       (prn "tx" tx)
       (spit "error-ctx.edn" (pr-str (assoc ctx :t t)))
       (throw e))))
-      
+
 ;; Up to here we've only dealt with extracting information from datomic
 ;; transactions, and turning them into
 ;; abstract "ops" (:ensure-columns, :upsert, :delete, etc). So this is all
@@ -693,7 +634,7 @@
         ;; from the beginning of the log
         nil)))))
 
-(defn sync-to-latest
+(defn ^:export sync-to-latest
   "Convenience function that combines the ingredients above for the common case of
   processing all new transactions up to the latest one."
   [datomic-conn pg-conn metaschema]
@@ -712,38 +653,35 @@
         txs (->> (d/tx-range datomic-conn {:start (:start-t ctx)
                                            :end (inc (:end-t ctx)) ;; :end is exclusive
                                            :limit -1})
-                 ;; Remove datoms recording to the partition. They confuse plenish
-                 (map (fn [tx] (update tx :data (fn [data]
-                                                  (remove #(-> % :e (= 0)) data))))))]
+                 queries/remove-partition-datoms)]
 
     ;; Get to work
     (import-tx-range ctx datomic-conn pg-conn txs)))
 
-(defn add-missed-table
+(defn ^:export add-missed-table
   "Convenience function that will add a table to that was missed in a prior executions (normally b/c it wasn't in the metaschema).
    missed-attr: The key attribute from a metaschema corresponding to the forgotten table"
   [datomic-conn pg-conn metaschema missed-attr t]
   (let [;; A rebuilt metaschema containing *only* the table we missed
         metaschema {:tables {missed-attr (-> metaschema :tables missed-attr)}}
-        ;; Earlist transaction where that attribute was used
-        max-t (or t (let [min-tx (ffirst (d/q '[:find (min ?tx)
-                                                :in $ ?attr
-                                                :where
-                                                [?e ?attr ?val ?tx]]
-                                              (d/db datomic-conn) missed-attr))
-                          _ (prn "Having to search for tx...")
-                          max-t (dec (tx->t datomic-conn min-tx))
-                          _ (prn "Found t=" max-t)] max-t))
+        ;; We try several fancy ways to know where to start from.
+        max-t (or t (let [starting-tx (or (queries/find-latest-recorded-tx-of-attr metaschema datomic-conn pg-conn missed-attr)
+                                          (queries/first-tx-of-attr datomic-conn missed-attr))
+                          t-of-starting-tx (or
+                                            (queries/tx->t-by-query pg-conn starting-tx)
+                                            (queries/tx->t-by-search datomic-conn starting-tx))
+                          ;; initial-ctx takes in a max-tx, which is the highest tx we think we've seen before, so we've got to back up one to get to the prior TX
+                          max-t (dec t-of-starting-tx)]
+                      max-t))
         ctx   (-> (initial-ctx datomic-conn metaschema max-t)
                   ;; The transactions and idents tables will have already been written to, so trying to re-write to them will be redundant
                   (update :tables dissoc :db/txInstant)
                   (update :tables dissoc :db/ident))
         _ (spit "start-ctx.edn" (pr-str ctx))
-        txs (->> (d/tx-range datomic-conn {:start (:start-t ctx)
-                                           :end (inc (:end-t ctx)) ;; :end is exclusive
-                                           :limit -1})
-                 ;; Remove datoms recording to the partition. They confuse plenish
-                 (map (fn [tx] (update tx :data (fn [data]
-                                                  (remove #(-> % :e (= 0)) data))))))]
+        txs (->> (queries/retrying-tx-range datomic-conn (:start-t ctx) (inc (:end-t ctx))) ;; :end is exclusive
+                 (queries/remove-partition-datoms)
+                 ;; Filtering by namespace would be incorrect behavior if we had an attribute that didn't share a namespace with all of it's entities.
+                 ;; However, we generally don't have that. This vastly speeds up the process.
+                 (queries/filter-datoms-by-attrs (queries/ids-of-attrs-sharing-namespace datomic-conn missed-attr)))]
     ;; Get to work
     (import-tx-range ctx datomic-conn pg-conn txs)))

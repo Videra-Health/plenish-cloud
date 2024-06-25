@@ -1,6 +1,6 @@
 (ns lambdaisland.plenish-cloud.errors)
 
-(defn rec-ex-data
+(defn ^:export rec-ex-data
   "Like ex-data, but merges in the data from all 'cause' exceptions.
    The inner most exceptions win key collisions."
   [err]
