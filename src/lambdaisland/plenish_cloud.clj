@@ -673,6 +673,7 @@
                           ;; initial-ctx takes in a max-tx, which is the highest tx we think we've seen before, so we've got to back up one to get to the prior TX
                           max-t (dec t-of-starting-tx)]
                       max-t))
+        _ (prn "starting with t=" max-t)
         ctx   (-> (initial-ctx datomic-conn metaschema max-t)
                   ;; The transactions and idents tables will have already been written to, so trying to re-write to them will be redundant
                   (update :tables dissoc :db/txInstant)

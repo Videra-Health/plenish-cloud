@@ -31,22 +31,24 @@
    first
    :transactions/t))
 
-
 (defn find-latest-recorded-tx-of-attr
   "Given a membership attribute, estimates the latest transaction that might have recorded it into SQL.
    It's an estimation because we don't keep track of when each row was created, so we estimate the latest by the greatest id."
   [ctx datomic-conn pg-conn missed-attr]
   (let [table-of-missing-attr (util/table-name ctx missed-attr)
-        ids (map :question_choice_logic/db__id
-                 (jdbc/execute! pg-conn [(str "SELECT db__id FROM raw ." table-of-missing-attr)]))
-        tx (->> (d/q '[:find ?tx ?when
-                       :in $ [?e ...]
-                       :where
-                       [?e _ _ ?tx]
-                       [?tx :db/txInstant ?when]]
-                     (d/db datomic-conn) ids)
-                (sort-by second)
-                ffirst)]
+        ids (try (map (comp second first) ;; Unwraps the query result w/o having to know the table name
+                      (jdbc/execute! pg-conn [(str "SELECT db__id FROM raw ." table-of-missing-attr)]))
+                 (catch org.postgresql.util.PSQLException _e
+                   ;; Likely the table doesn't exist, so there are no latest transactions on it. We'd expect to return nil.
+                   nil))
+        tx (when ids (->> (d/q '[:find ?tx ?when
+                                 :in $ [?e ...]
+                                 :where
+                                 [?e _ _ ?tx]
+                                 [?tx :db/txInstant ?when]]
+                               (d/db datomic-conn) ids)
+                          (sort-by second)
+                          ffirst))]
     tx))
 
 (defn first-tx-of-attr
@@ -59,24 +61,27 @@
                (d/db datomic-conn) attr)))
 
 (defn retrying-tx-range [datomic-conn start end]
-  (let [last-t (atom nil)]
-    (try
-      (map (fn [tx]
-             (reset! last-t (:t tx))
-             tx) (d/tx-range datomic-conn {:start start
-                                           :end end
-                                           :limit -1}))
-      (catch Exception e
-        (if (-> e ex-data :cognitect.anomalies/message (= "Specified iterator was dropped"))
-          (do
-            (prn "Lost connection at: " @last-t ", but retrying..." [])
-            (retrying-tx-range datomic-conn start @last-t))
-          (do
-            (prn "Other error"
-                 (-> e ex-data :cognitect.anomalies/message (= "Specified iterator was dropped"))
-                 (-> e ex-data :cognitect.anomalies/message)
-                 (-> e ex-data))
-            (throw e)))))))
+  (let [full-range (d/tx-range datomic-conn {:start start
+                                             :end end
+                                             :limit -1})]
+    ((fn repeat [resume-at range]
+       (lazy-seq
+        (try
+          (let [[x & xs] range]
+            (when x ;; Stopping point
+              (cons x (repeat (-> x :t inc) xs))))
+          (catch Exception e
+            (if (-> e ex-data :cognitect.anomalies/message (= "Specified iterator was dropped"))
+              (do
+                (prn "Lost connection at: " resume-at ", but retrying..." [])
+                (retrying-tx-range datomic-conn resume-at end))
+              (do
+                (prn "Other error"
+                     (-> e ex-data :cognitect.anomalies/message (= "Specified iterator was dropped"))
+                     (-> e ex-data :cognitect.anomalies/message)
+                     (-> e ex-data))
+                (throw e)))))))
+     start full-range)))
 
 (defn remove-partition-datoms
   "Removes datoms recording to the partition. They confuse plenish and we don't have a table for them anyway."
