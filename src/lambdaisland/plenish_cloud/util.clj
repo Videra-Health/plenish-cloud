@@ -76,6 +76,8 @@
   attribute whose values are to be stored in the column."
   [ctx mem-attr col-attr]
   ;;{:pre [(some? col-attr)]}
+  (when-not (some? col-attr)
+    (throw (ex-info "Column attribute is nil" {:mem-attr mem-attr :col-attr col-attr})))
   (get-in ctx
           [:tables mem-attr :rename col-attr]
           (dash->underscore (name col-attr))))
