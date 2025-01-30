@@ -101,6 +101,16 @@
        (map first)
        set))
 
+(defn ids-of-schema-attrs [datomic-conn]
+  (->> #{:db/ident :db/valueType :db/cardinality :db/unique}
+       (d/q '[:find ?e
+              :in $ [?attr ...]
+              :where
+              [?e :db/ident ?attr]]
+            (d/db datomic-conn))
+       (map first)
+       set))
+
 (defn filter-datoms-by-attrs
   [attrs txes]
   (->> txes
