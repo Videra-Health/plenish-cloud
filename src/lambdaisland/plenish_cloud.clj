@@ -1,15 +1,18 @@
 (ns lambdaisland.plenish-cloud
   "Transfer datomic data into a relational target database, transaction per
   transaction."
-  (:require [charred.api :as charred]
-            [clojure.string :as str]
-            [datomic.client.api :as d]
-            [honey.sql :as honey]
-            [lambdaisland.plenish-cloud.errors :as errors]
-            [lambdaisland.plenish-cloud.queries :as queries]
-            [lambdaisland.plenish-cloud.util :as util]
-            [next.jdbc :as jdbc])
-  (:import [java.util Date]))
+  (:require
+   [charred.api :as charred]
+   [clojure.set :as set]
+   [clojure.string :as str]
+   [datomic.client.api :as d]
+   [honey.sql :as honey]
+   [lambdaisland.plenish-cloud.errors :as errors]
+   [lambdaisland.plenish-cloud.queries :as queries]
+   [lambdaisland.plenish-cloud.util :as util]
+   [next.jdbc :as jdbc])
+  (:import
+   [java.util Date]))
 
 (set! *warn-on-reflection* true)
 
@@ -683,6 +686,11 @@
                  (queries/remove-partition-datoms)
                  ;; Filtering by namespace would be incorrect behavior if we had an attribute that didn't share a namespace with all of it's entities.
                  ;; However, we generally don't have that. This vastly speeds up the process.
-                 (queries/filter-datoms-by-attrs (queries/ids-of-attrs-sharing-namespace datomic-conn missed-attr)))]
+                 (queries/filter-datoms-by-attrs
+                  (set/union (queries/ids-of-attrs-sharing-namespace datomic-conn missed-attr)
+                             ;; We need schema related attributes so the import process
+                             ;; knows about any schema changes that occur in the import
+                             ;; range.
+                             (queries/ids-of-schema-attrs datomic-conn))))]
     ;; Get to work
     (import-tx-range ctx datomic-conn pg-conn txs)))
