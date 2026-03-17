@@ -163,6 +163,7 @@
                             (name value))
       :db.type/instant [:raw (format "to_timestamp(%.3f)"
                                      (double (/ (util/clamp (.getTime ^java.util.Date value) pg-min-date pg-max-date) 1000)))]
+      :db.type/string (str/replace value "\0" "")
       value)))
 
 ;; The functions below are the heart of the process
