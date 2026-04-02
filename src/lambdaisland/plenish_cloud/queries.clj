@@ -60,6 +60,9 @@
                  [?e ?attr ?val ?tx]]
                (d/db datomic-conn) attr)))
 
+(defn- request-too-large? [e]
+  (some-> e ex-data :http-result :status (= 413)))
+
 (defn retrying-tx-range [datomic-conn start end]
   (let [full-range (d/tx-range datomic-conn {:start start
                                              :end end
@@ -71,10 +74,22 @@
             (when x ;; Stopping point
               (cons x (repeat (-> x :t inc) xs))))
           (catch Exception e
-            (if (-> e ex-data :cognitect.anomalies/message (= "Specified iterator was dropped"))
+            (cond
+              (-> e ex-data :cognitect.anomalies/message (= "Specified iterator was dropped"))
               (do
-                (prn "Lost connection at: " resume-at ", but retrying..." [])
+                (prn "Lost connection at: " resume-at ", but retrying...")
                 (retrying-tx-range datomic-conn resume-at end))
+
+              (request-too-large? e)
+              (let [mid (long (/ (+ resume-at end) 2))]
+                (if (<= mid resume-at)
+                  (throw e)
+                  (do
+                    (prn "Request too large, splitting range" [resume-at end] "at" mid)
+                    (concat (retrying-tx-range datomic-conn resume-at mid)
+                            (retrying-tx-range datomic-conn mid end)))))
+
+              :else
               (do
                 (prn "Other error"
                      (-> e ex-data :cognitect.anomalies/message (= "Specified iterator was dropped"))
