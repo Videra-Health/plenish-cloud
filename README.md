@@ -1,5 +1,7 @@
 # Plenish-Cloud
 
+[![AI Review Policy: Trusted](https://img.shields.io/badge/AI%20Review%20Policy-%E2%9C%85%20Trusted-8250DF?style=flat-square&labelColor=24292f)](https://app.superthread.com/viderahealth/page-930-ai-development-policy)
+
 Fork of [Plenish](https://github.com/lambdaisland/plenish) but that works for Datomic Cloud.
 
 The API is identical, but adds the following limitations:
